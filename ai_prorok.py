@@ -1,6 +1,5 @@
 import random
 import json
-import time
 import asyncio
 from openai import OpenAI
 import os
@@ -8,14 +7,12 @@ from dotenv import load_dotenv
 import vk_api
 import requests
 import logging
-from typing import List, Tuple
+from typing import List, Tuple, Optional, Dict
 from datetime import datetime, time as dt_time, timedelta
 import pytz
+from dataclasses import dataclass
+import time
 
-"""
-
-Генерация пророчества с отложенной публикацией
-"""
 
 # Настройка логирования с московским временем
 class MoscowTimeFormatter(logging.Formatter):
@@ -35,19 +32,41 @@ logger = logging.getLogger(__name__)
 for handler in logging.root.handlers:
     handler.setFormatter(MoscowTimeFormatter())
 
-load_dotenv()
-
-# Загрузка переменных окружения
-OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
-VK_TOKEN = os.getenv('VK_TOKEN')
-TG_TOKEN = os.getenv('TG_TOKEN')
+# Константы
 TG_CHAT_ID = "@prorochestva_ot_bota"
+GENERATION_OFFSET = 600  # 10 минут до публикации
+STATE_FILE = "prophecy_state.json"  # Файл для сохранения состояния
 
 # Глобальный флаг для остановки
 stop_flag = False
 
 # Московский часовой пояс
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
+
+
+@dataclass
+class ProphecySchedule:
+    """Расписание для пророчества"""
+    generation_time: datetime  # Когда генерировать
+    publish_time: datetime  # Когда публиковать
+    prophecy: Optional[str] = None  # Сгенерированное пророчество
+    generated: bool = False  # Сгенерировано ли
+
+
+def load_env_keys() -> Dict[str, Optional[str]]:
+    """
+    Загружает ключи из .env файла при каждом вызове.
+    Это позволяет обновлять .env во время работы программы.
+    """
+    load_dotenv(override=True)  # override=True перезагружает переменные
+
+    keys = {
+        'OPENAI_API_KEY': os.getenv('OPENAI_API_KEY'),
+        'VK_TOKEN': os.getenv('VK_TOKEN'),
+        'TG_TOKEN': os.getenv('TG_TOKEN')
+    }
+
+    return keys
 
 
 def get_moscow_time() -> datetime:
@@ -62,16 +81,26 @@ def format_moscow_time(dt: datetime = None, format_str: str = "%Y-%m-%d %H:%M:%S
     return dt.strftime(format_str)
 
 
-def dct(my_dict: dict) -> dict:
-    """Сортировка словаря по значениям в порядке убывания"""
-    return {k: v for k, v in sorted(my_dict.items(), key=lambda item: item[1], reverse=True)}
+def generate_next_publish_time() -> datetime:
+    """Генерирует время следующей публикации (завтра в случайное время)"""
+    now_moscow = get_moscow_time()
+    tomorrow = now_moscow + timedelta(days=1)
+
+    # Случайное время на завтра
+    publish_hour = random.randint(0, 23)
+    publish_minute = random.randint(0, 59)
+    publish_second = random.randint(0, 59)
+
+    publish_time = MOSCOW_TZ.localize(datetime(
+        tomorrow.year, tomorrow.month, tomorrow.day,
+        publish_hour, publish_minute, publish_second
+    ))
+
+    return publish_time
 
 
 def optimized_choice_lst(lst: list, max_iterations: int = 20000) -> Tuple[list, list]:
-    """
-    Оптимизированная версия choice_lst
-    Возвращает кортеж: (список выборок, список отсутствующих элементов)
-    """
+    """Оптимизированная версия choice_lst"""
     if not lst:
         return [], []
 
@@ -79,31 +108,23 @@ def optimized_choice_lst(lst: list, max_iterations: int = 20000) -> Tuple[list, 
     lst_choice = []
     found_elements = set()
 
-    logger.info(f"Начало выборки из {len(unique_elements)} уникальных элементов")
-
     for i in range(max_iterations):
         if len(found_elements) == len(unique_elements):
             break
-
         choice = random.choice(lst)
         lst_choice.append(choice)
         found_elements.add(choice)
 
-    # Находим элементы, которые не попали в выборку
     missing_elements = list(unique_elements - found_elements)
 
     if missing_elements:
-        logger.info(f"Элементы, не попавшие в выборку: {missing_elements[:5]} (всего: {len(missing_elements)})")
-
-    logger.info(f"Выполнено итераций: {len(lst_choice)}, найдено уникальных: {len(found_elements)}")
+        logger.debug(f"Элементы, не попавшие в выборку: {missing_elements[:5]}")
 
     return lst_choice, random.sample(missing_elements, min(2, len(missing_elements)))
 
 
 def create_dct(sampled_lst: list) -> List[Tuple[str, int]]:
-    """
-    Создает отсортированный список кортежей (слово, частота) для топ-3 самых частых слов
-    """
+    """Создает список топ-3 самых частых слов"""
     frequency_dict = {}
     for word in sampled_lst:
         frequency_dict[word] = frequency_dict.get(word, 0) + 1
@@ -115,7 +136,15 @@ def create_dct(sampled_lst: list) -> List[Tuple[str, int]]:
 def send_to_telegram(message: str) -> bool:
     """Отправляет сообщение в Telegram канал"""
     try:
-        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+        # Загружаем ключи при каждом запросе
+        keys = load_env_keys()
+        tg_token = keys['TG_TOKEN']
+
+        if not tg_token:
+            logger.error("TG_TOKEN не найден в .env файле")
+            return False
+
+        url = f"https://api.telegram.org/bot{tg_token}/sendMessage"
         payload = {
             'chat_id': TG_CHAT_ID,
             'text': message,
@@ -124,7 +153,6 @@ def send_to_telegram(message: str) -> bool:
 
         response = requests.post(url, data=payload, timeout=10)
         response.raise_for_status()
-
         logger.info("Сообщение успешно отправлено в Telegram")
         return True
 
@@ -136,7 +164,15 @@ def send_to_telegram(message: str) -> bool:
 def send_to_vk(message: str) -> bool:
     """Отправляет сообщение в группу VK"""
     try:
-        vk_session = vk_api.VkApi(token=VK_TOKEN)
+        # Загружаем ключи при каждом запросе
+        keys = load_env_keys()
+        vk_token = keys['VK_TOKEN']
+
+        if not vk_token:
+            logger.error("VK_TOKEN не найден в .env файле")
+            return False
+
+        vk_session = vk_api.VkApi(token=vk_token)
         vk = vk_session.get_api()
 
         group_id = -229101116
@@ -147,7 +183,6 @@ def send_to_vk(message: str) -> bool:
             from_group=1
         )
         logger.info(f"Ответ VK: {result}")
-
         logger.info("Сообщение успешно отправлено в VK")
         return True
 
@@ -157,14 +192,25 @@ def send_to_vk(message: str) -> bool:
 
 
 def get_openai_response(prompt: str, max_retries: int = 3) -> str:
-    """Получает ответ от OpenAI API с обработкой ошибок"""
+    """
+    Получает ответ от OpenAI API.
+    Ключ загружается при каждом вызове, что позволяет обновлять .env во время работы программы.
+    """
+    # Загружаем ключи при каждом запросе
+    keys = load_env_keys()
+    openai_api_key = keys['OPENAI_API_KEY']
+
+    if not openai_api_key:
+        logger.error("OPENAI_API_KEY не найден в .env файле")
+        return "Моя магия слов закончилась ровно там, где началась ваша надежда услышать нечто волшебное. Пророчествовать не буду, ибо мой ключ API отсутствует."
+
     openai_client = OpenAI(
-        api_key=OPENAI_API_KEY,
+        api_key=openai_api_key,
         base_url="https://api.proxyapi.ru/openai/v1",
         timeout=30
     )
 
-    system_message = f"Ты пророк, который предсказывает будущее. Сочини пророчество на указанный день ({get_moscow_time().ctime()}) по указанным словам, не цитируя их при этом, но передавая смысл. В конце пророчества резюмируй двустишием"
+    system_message = f"Ты пророк, который предсказывает будущее. Сочини пророчество на указанный день ({get_moscow_time().ctime()}) и в рамках дня по указанным словам, не цитируя их при этом, но передавая смысл. Меньше пафоса. В конце пророчества резюмируй двустишием"
 
     for attempt in range(max_retries):
         try:
@@ -174,7 +220,7 @@ def get_openai_response(prompt: str, max_retries: int = 3) -> str:
                 model="gpt-4o",
                 messages=[
                     {"role": "system", "content": system_message},
-                    {"role": "user", "content": f'{prompt}'}
+                    {"role": "user", "content": prompt}
                 ],
                 timeout=30
             )
@@ -201,7 +247,6 @@ async def async_input_listener():
 
     while not stop_flag:
         try:
-            # Используем асинхронный ввод
             user_input = await loop.run_in_executor(None, input, "Введите 'stop' для остановки программы: ")
 
             if user_input.strip().lower() in ['stop', '0', 'exit', 'quit']:
@@ -216,94 +261,250 @@ async def async_input_listener():
             await asyncio.sleep(1)
 
 
-async def async_sleep_with_interrupt(seconds: int):
-    """Асинхронный sleep с возможностью прерывания"""
-    global stop_flag
+class ProphecyScheduler:
+    """Планировщик для генерации и публикации пророчеств"""
 
-    interval = 1  # Проверяем флаг каждую секунду
-    total_intervals = seconds // interval
+    def __init__(self):
+        self.next_publish_time: Optional[datetime] = None
+        self.next_generation_time: Optional[datetime] = None
+        self.current_prophecy: Optional[str] = None
+        self.is_generating: bool = False
+        self.generated_for_current_cycle: bool = False  # Флаг для предотвращения повторной генерации
 
-    for _ in range(total_intervals):
-        if stop_flag:
-            break
-        await asyncio.sleep(interval)
-
-    # Ждем оставшееся время
-    remaining = seconds % interval
-    if remaining > 0 and not stop_flag:
-        await asyncio.sleep(remaining)
-
-
-def calculate_next_run_time() -> Tuple[int, str]:
-    """Вычисляет время следующего запуска в московском часовом поясе"""
-    now_moscow = get_moscow_time()
-    tomorrow = now_moscow + timedelta(days=1)
-
-    # Начало и конец завтрашнего дня в московском времени
-    start_of_day = MOSCOW_TZ.localize(datetime(
-        tomorrow.year, tomorrow.month, tomorrow.day,
-        0, 0, 0
-    ))
-    end_of_day = MOSCOW_TZ.localize(datetime(
-        tomorrow.year, tomorrow.month, tomorrow.day,
-        23, 59, 30  # минус 30 секунд
-    ))
-
-    start_timestamp = int(start_of_day.timestamp())
-    end_timestamp = int(end_of_day.timestamp())
-
-    timestamp = random.randint(start_timestamp, end_timestamp)
-
-    # Конвертируем обратно в московское время для читаемого формата
-    next_run_dt = datetime.fromtimestamp(timestamp, MOSCOW_TZ)
-    readable_date = format_moscow_time(next_run_dt)
-
-    wait_time = timestamp - int(now_moscow.timestamp()) - 10    # задержка 10 сек
-
-    logger.info(f"Текущее время МСК: {format_moscow_time(now_moscow)}")
-    logger.info(f"Следующий запуск МСК: {readable_date}")
-    logger.info(f"Ожидание: {wait_time} секунд ({wait_time / 3600:.2f} часов)")
-
-    return wait_time, readable_date
-
-
-async def generate_prophecy_cycle():
-    """Основной цикл генерации пророчеств"""
-    global stop_flag
-
-    # Загрузка словарей один раз при старте
-    try:
-        with open("nouns.json", "r", encoding='utf-8') as fh:
-            nouns = json.load(fh)
-        with open("verbs.json", "r", encoding='utf-8') as fh:
-            verbs = json.load(fh)
-        with open("adject.json", "r", encoding='utf-8') as fh:
-            adjectives = json.load(fh)
-
-        logger.info(
-            f"Загружено: существительных - {len(nouns)}, глаголов - {len(verbs)}, прилагательных - {len(adjectives)}")
-    except Exception as e:
-        logger.error(f"Ошибка загрузки словарей: {e}")
-        return
-
-    cycle_count = 0
-
-    while not stop_flag:
+        # Загружаем словари один раз
         try:
-            cycle_count += 1
-            current_time_moscow = format_moscow_time()
-            logger.info(f"=== Цикл пророчества #{cycle_count} ({current_time_moscow} МСК) ===")
+            with open("nouns.json", "r", encoding='utf-8') as fh:
+                self.nouns = json.load(fh)
+            with open("verbs.json", "r", encoding='utf-8') as fh:
+                self.verbs = json.load(fh)
+            with open("adject.json", "r", encoding='utf-8') as fh:
+                self.adjectives = json.load(fh)
 
+            logger.info(
+                f"Загружено: существительных - {len(self.nouns)}, глаголов - {len(self.verbs)}, прилагательных - {len(self.adjectives)}")
+        except Exception as e:
+            logger.error(f"Ошибка загрузки словарей: {e}")
+            raise
+
+    def save_state(self):
+        """
+        Сохраняет текущее состояние в файл.
+        Это позволяет восстановить состояние после перезапуска программы.
+        """
+        try:
+            state = {
+                'next_publish_time': self.next_publish_time.isoformat() if self.next_publish_time else None,
+                'next_generation_time': self.next_generation_time.isoformat() if self.next_generation_time else None,
+                'current_prophecy': self.current_prophecy,
+                'is_generating': self.is_generating,
+                'generated_for_current_cycle': self.generated_for_current_cycle
+            }
+
+            with open(STATE_FILE, 'w', encoding='utf-8') as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+
+            logger.debug(f"Состояние сохранено в {STATE_FILE}")
+        except Exception as e:
+            logger.error(f"Ошибка сохранения состояния: {e}")
+
+    def load_state(self) -> bool:
+        """
+        Загружает состояние из файла, если он существует.
+        Возвращает True, если состояние успешно загружено, False в противном случае.
+        """
+        try:
+            if not os.path.exists(STATE_FILE):
+                logger.info(f"Файл состояния {STATE_FILE} не найден, начинаем с нуля")
+                return False
+
+            with open(STATE_FILE, 'r', encoding='utf-8') as f:
+                state = json.load(f)
+
+            # Восстанавливаем времена
+            if state['next_publish_time']:
+                self.next_publish_time = datetime.fromisoformat(state['next_publish_time'])
+            if state['next_generation_time']:
+                self.next_generation_time = datetime.fromisoformat(state['next_generation_time'])
+
+            # Восстанавливаем пророчество и флаги
+            self.current_prophecy = state.get('current_prophecy')
+            self.is_generating = state.get('is_generating', False)
+            self.generated_for_current_cycle = state.get('generated_for_current_cycle', False)
+
+            logger.info(f"Состояние восстановлено из {STATE_FILE}")
+            if self.next_publish_time:
+                logger.info(f"Следующая публикация: {format_moscow_time(self.next_publish_time)}")
+            if self.next_generation_time:
+                logger.info(f"Следующая генерация: {format_moscow_time(self.next_generation_time)}")
+            if self.current_prophecy:
+                logger.info(f"Найдено сохраненное пророчество (готово к публикации)")
+
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка загрузки состояния: {e}")
+            return False
+
+    async def initialize(self):
+        """
+        Инициализация при старте программы.
+        Проверяет наличие сохраненного состояния и восстанавливает его, если возможно.
+        """
+        logger.info("Инициализация программы...")
+
+        # Пытаемся загрузить сохраненное состояние
+        state_loaded = self.load_state()
+
+        if state_loaded:
+            # Проверяем, не устарело ли состояние
+            now = get_moscow_time()
+
+            # Если время публикации уже прошло и есть пророчество - публикуем сразу
+            if self.current_prophecy and self.next_publish_time and now >= self.next_publish_time:
+                logger.info("Найдено непубликованное пророчество, публикуем немедленно...")
+                await self._publish_scheduled_prophecy()
+            # Если время генерации прошло, но пророчество не сгенерировано - генерируем
+            elif not self.current_prophecy and self.next_generation_time and now >= self.next_generation_time and not self.generated_for_current_cycle:
+                logger.info("Пропущена генерация, генерируем пророчество немедленно...")
+                await self._generate_next_prophecy()
+            else:
+                logger.info("Состояние актуально, продолжаем работу по расписанию")
+                return
+
+        # Если состояние не загружено или нет запланированного времени - создаем новое расписание
+        if not self.next_publish_time:
+            logger.info("Создание нового расписания - генерация первого пророчества...")
+
+            # Генерируем время следующей публикации (на завтра)
+            self.next_publish_time = generate_next_publish_time()
+            self.next_generation_time = self.next_publish_time - timedelta(seconds=GENERATION_OFFSET)
+
+            # Сбрасываем флаг генерации для нового цикла
+            self.generated_for_current_cycle = False
+
+            # Сохраняем состояние
+            self.save_state()
+
+            # Генерируем и публикуем пророчество сразу
+            await self._generate_and_publish_immediate()
+
+            logger.info(
+                f"Первое пророчество опубликовано. Следующее будет сгенерировано в {format_moscow_time(self.next_generation_time)} и опубликовано в {format_moscow_time(self.next_publish_time)}")
+
+    async def _generate_and_publish_immediate(self):
+        """Немедленная генерация и публикация пророчества (при старте программы)"""
+        try:
+            # Генерируем пророчество
+            prophecy = await self._generate_prophecy()
+
+            # Генерируем время следующей публикации
+            next_next_publish_time = self.next_publish_time
+            next_next_time_str = format_moscow_time(next_next_publish_time)
+
+            # Формируем сообщение с указанием времени следующей публикации
+            current_time_str = format_moscow_time()
+            full_message = f"🔮 Пророчество от бота ({current_time_str} МСК):\n\n{prophecy}\n\n" \
+                           f"⏰ Следующее пророчество будет опубликовано {next_next_time_str} МСК"
+
+            # Сохраняем состояние
+            self.save_state()
+
+            # Логируем пророчество
+            with open("prophecies_log.txt", "a", encoding="utf-8") as log_file:
+                log_file.write(f"\n{format_moscow_time()} - ПЕРВОЕ ПРОРОЧЕСТВО\n")
+                log_file.write(f"Следующая публикация: {next_next_time_str}\n")
+                log_file.write(f"{prophecy}\n{'-' * 50}\n")
+
+            # Публикуем
+            await self._publish_prophecy(full_message)
+
+            logger.info(
+                f"Первое пророчество опубликовано. Следующее будет сгенерировано в {format_moscow_time(self.next_generation_time)} и опубликовано в {next_next_time_str}")
+
+        except Exception as e:
+            logger.error(f"Ошибка при немедленной генерации и публикации: {e}")
+
+    async def run(self):
+        """Основной цикл планировщика"""
+        logger.info("Запуск основного цикла планировщика...")
+
+        while not stop_flag:
+            now = get_moscow_time()
+
+            # Проверяем, пора ли генерировать следующее пророчество
+            # ВАЖНО: генерируем только если еще не генерировали для текущего цикла
+            if (self.next_generation_time and
+                now >= self.next_generation_time and
+                not self.is_generating and
+                not self.generated_for_current_cycle):
+                logger.info(f"Пора генерировать следующее пророчество!")
+                await self._generate_next_prophecy()
+
+            # Проверяем, пора ли публиковать
+            if self.current_prophecy and self.next_publish_time and now >= self.next_publish_time:
+                logger.info(f"Пора публиковать пророчество!")
+                await self._publish_scheduled_prophecy()
+
+            # Точное ожидание 1 секунды
+            await asyncio.sleep(1)
+
+        # Сохраняем состояние при выходе
+        logger.info("Сохранение состояния перед выходом...")
+        self.save_state()
+
+    async def _generate_next_prophecy(self):
+        """Генерация следующего пророчества по расписанию"""
+        self.is_generating = True
+        self.save_state()  # Сохраняем флаг генерации
+
+        try:
+            logger.info("Начало генерации пророчества по расписанию...")
+
+            # Генерируем пророчество
+            prophecy = await self._generate_prophecy()
+
+            # Определяем время СЛЕДУЮЩЕЙ публикации (после той, которая сейчас запланирована)
+            next_next_publish_time = generate_next_publish_time()
+            next_next_time_str = format_moscow_time(next_next_publish_time)
+
+            # Формируем сообщение для публикации с указанием времени СЛЕДУЮЩЕЙ публикации
+            current_publish_time_str = format_moscow_time(self.next_publish_time)
+            full_message = f"🔮 Пророчество от бота ({current_publish_time_str} МСК):\n\n{prophecy}\n\n" \
+                           f"⏰ Следующее пророчество будет опубликовано {next_next_time_str} МСК"
+
+            self.current_prophecy = full_message
+            self.generated_for_current_cycle = True  # Устанавливаем флаг, что генерация выполнена
+            self.save_state()  # Сохраняем сгенерированное пророчество
+
+            logger.info(f"Пророчество сгенерировано, готово к публикации в {current_publish_time_str}")
+            logger.info(f"Следующее пророчество после этой публикации будет в {next_next_time_str}")
+
+            # Логируем сгенерированное пророчество
+            with open("prophecies_log.txt", "a", encoding="utf-8") as log_file:
+                log_file.write(f"\n{format_moscow_time()} - СГЕНЕРИРОВАНО ДЛЯ ПУБЛИКАЦИИ\n")
+                log_file.write(f"Время публикации: {current_publish_time_str}\n")
+                log_file.write(f"Следующая публикация: {next_next_time_str}\n")
+                log_file.write(f"{prophecy}\n{'-' * 50}\n")
+
+        except Exception as e:
+            logger.error(f"Ошибка генерации пророчества: {e}")
+            self.current_prophecy = None
+            self.generated_for_current_cycle = False
+        finally:
+            self.is_generating = False
+            self.save_state()
+
+    async def _generate_prophecy(self) -> str:
+        """Генерация пророчества на основе случайных слов"""
+        try:
             # Генерация случайных выборок
             sample_size = random.randint(100, 20000)
-            logger.info(f"Размер выборки: {sample_size}")
 
             # Создание случайных выборок
-            noun_samples = [random.choice(nouns) for _ in range(sample_size)]
-            verb_samples = [random.choice(verbs) for _ in range(sample_size)]
-            adjective_samples = [random.choice(adjectives) for _ in range(sample_size)]
+            noun_samples = [random.choice(self.nouns) for _ in range(sample_size)]
+            verb_samples = [random.choice(self.verbs) for _ in range(sample_size)]
+            adjective_samples = [random.choice(self.adjectives) for _ in range(sample_size)]
 
-            # Анализ частотности с исправленной функцией
+            # Анализ частотности
             choice_nouns, rare_nouns = optimized_choice_lst(noun_samples)
             choice_verbs, rare_verbs = optimized_choice_lst(verb_samples)
             choice_adjectives, rare_adjectives = optimized_choice_lst(adjective_samples)
@@ -312,62 +513,75 @@ async def generate_prophecy_cycle():
             top_verbs = create_dct(choice_verbs)
             top_adjectives = create_dct(choice_adjectives)
 
-            logger.info(f"Топ существительные: {top_nouns}, редкие: {rare_nouns}")
-            logger.info(f"Топ глаголы: {top_verbs}, редкие: {rare_verbs}")
-            logger.info(f"Топ прилагательные: {top_adjectives}, редкие: {rare_adjectives}")
-
-            # Формирование промпта для OpenAI
+            # Формирование промпта
             prompt = f"Существительные: {top_nouns} / {rare_nouns}\n" \
                      f"Глаголы: {top_verbs} / {rare_verbs}\n" \
                      f"Прилагательные: {top_adjectives} / {rare_adjectives}"
 
-            # Логирование промпта с московским временем
+            # Логирование промпта
             with open("prophecies_log.txt", "a", encoding="utf-8") as log_file:
-                log_file.write(f"\n{format_moscow_time()}\n{prompt}\n{'+' * 50}\n")
+                log_file.write(f"\n{format_moscow_time()} - ГЕНЕРАЦИЯ\n{prompt}\n{'+' * 50}\n")
 
-            # Получение ответа от OpenAI
-            prophecy = await asyncio.get_event_loop().run_in_executor(None, get_openai_response, prompt)
+            # Получение ответа от OpenAI (синхронно в отдельном потоке)
+            loop = asyncio.get_event_loop()
+            prophecy = await loop.run_in_executor(None, get_openai_response, prompt)
 
-            # Вывод результата
-            print("=" * 50)
-            print("ПРОРОЧЕСТВО:")
-            print(prophecy)
-            print("=" * 50)
-
-            # Вычисление времени следующего запуска
-            wait_time, next_prophecy_time = calculate_next_run_time()
-
-            logger.info(f"Следующее пророчество будет в: {next_prophecy_time} МСК (через {wait_time} секунд)")
-
-            # Формирование сообщения для соцсетей с московским временем
-            current_time_display = format_moscow_time()
-            full_message = f"🔮 Пророчество от бота ({current_time_display} МСК):\n{prophecy}\n\nСледующее пророчество будет {next_prophecy_time} МСК"
-
-            # Отправка в социальные сети
-            success_count = 0
-            if send_to_telegram(full_message):
-                success_count += 1
-            if send_to_vk(full_message):
-                success_count += 1
-
-            logger.info(f"Сообщение отправлено в {success_count} из 2 социальных сетей")
-
-            # Логирование пророчества с московским временем
-            with open("prophecies_log.txt", "a", encoding="utf-8") as log_file:
-                log_file.write(f"Пророчество:\n{prophecy}\nВремя: {format_moscow_time()} МСК\n{'-' * 50}\n")
-
-            # Асинхронное ожидание до следующего пророчества
-            logger.info(f"Ожидание следующего пророчества...")
-            await async_sleep_with_interrupt(wait_time)
-
-            if stop_flag:
-                logger.info("Цикл пророчеств остановлен по команде пользователя")
-                break
+            return prophecy
 
         except Exception as e:
-            logger.error(f"Ошибка в цикле пророчества: {e}")
-            # В случае ошибки ждем 5 минут перед повторной попыткой
-            await async_sleep_with_interrupt(300)
+            logger.error(f"Ошибка в процессе генерации: {e}")
+            return "Пророчество не удалось сгенерировать. Попробуйте позже."
+
+    async def _publish_scheduled_prophecy(self):
+        """Публикация запланированного пророчества"""
+        try:
+            if not self.current_prophecy:
+                logger.error("Нет пророчества для публикации")
+                return
+
+            logger.info(f"Публикация запланированного пророчества...")
+
+            # Публикуем
+            await self._publish_prophecy(self.current_prophecy)
+
+            # Определяем время следующей публикации
+            next_next_publish_time = generate_next_publish_time()
+            self.next_publish_time = next_next_publish_time
+            self.next_generation_time = self.next_publish_time - timedelta(seconds=GENERATION_OFFSET)
+
+            # Очищаем текущее пророчество и сбрасываем флаг генерации
+            self.current_prophecy = None
+            self.generated_for_current_cycle = False
+
+            # Сохраняем новое состояние
+            self.save_state()
+
+            logger.info(
+                f"Следующее пророчество запланировано: генерация в {format_moscow_time(self.next_generation_time)}, публикация в {format_moscow_time(self.next_publish_time)}")
+
+        except Exception as e:
+            logger.error(f"Ошибка публикации пророчества: {e}")
+
+    async def _publish_prophecy(self, message: str):
+        """Публикация пророчества в соцсети"""
+        try:
+            # Отправка в социальные сети
+            success_count = 0
+            if send_to_telegram(message):
+                success_count += 1
+            if send_to_vk(message):
+                success_count += 1
+
+            logger.info(f"Пророчество опубликовано в {success_count} из 2 социальных сетей")
+
+            # Логирование публикации
+            with open("prophecies_log.txt", "a", encoding="utf-8") as log_file:
+                log_file.write(f"\n{format_moscow_time()} - ПУБЛИКАЦИЯ\n")
+                log_file.write(f"Опубликовано в {success_count} соцсетей\n")
+                log_file.write(f"{'-' * 50}\n")
+
+        except Exception as e:
+            logger.error(f"Ошибка при публикации: {e}")
 
 
 async def main():
@@ -375,12 +589,19 @@ async def main():
     global stop_flag
 
     logger.info("Запуск программы пророчеств (время МСК)...")
-    logger.info(f"Текущее время на сервере: {format_moscow_time()} МСК")
+    logger.info(f"Текущее время: {format_moscow_time()} МСК")
+    logger.info(f"Генерация за {GENERATION_OFFSET} секунд до публикации")
 
     try:
-        # Запускаем обе задачи параллельно
+        # Создаем планировщик
+        scheduler = ProphecyScheduler()
+
+        # Инициализируем (восстанавливаем состояние или публикуем первое пророчество)
+        await scheduler.initialize()
+
+        # Запускаем планировщик и слушатель ввода параллельно
         await asyncio.gather(
-            generate_prophecy_cycle(),
+            scheduler.run(),
             async_input_listener()
         )
     except KeyboardInterrupt:
@@ -393,7 +614,7 @@ async def main():
 
 
 if __name__ == "__main__":
-    # Убедимся, что pytz установлен
+    # Проверяем наличие pytz
     try:
         import pytz
     except ImportError:
