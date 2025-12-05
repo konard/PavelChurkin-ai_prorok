@@ -270,6 +270,7 @@ class ProphecyScheduler:
         self.current_prophecy: Optional[str] = None
         self.is_generating: bool = False
         self.generated_for_current_cycle: bool = False  # Флаг для предотвращения повторной генерации
+        self.planned_next_publish_time: Optional[datetime] = None  # Время, указанное в пророчестве для следующей публикации
 
         # Загружаем словари один раз
         try:
@@ -297,7 +298,8 @@ class ProphecyScheduler:
                 'next_generation_time': self.next_generation_time.isoformat() if self.next_generation_time else None,
                 'current_prophecy': self.current_prophecy,
                 'is_generating': self.is_generating,
-                'generated_for_current_cycle': self.generated_for_current_cycle
+                'generated_for_current_cycle': self.generated_for_current_cycle,
+                'planned_next_publish_time': self.planned_next_publish_time.isoformat() if self.planned_next_publish_time else None
             }
 
             with open(STATE_FILE, 'w', encoding='utf-8') as f:
@@ -325,6 +327,8 @@ class ProphecyScheduler:
                 self.next_publish_time = datetime.fromisoformat(state['next_publish_time'])
             if state['next_generation_time']:
                 self.next_generation_time = datetime.fromisoformat(state['next_generation_time'])
+            if state.get('planned_next_publish_time'):
+                self.planned_next_publish_time = datetime.fromisoformat(state['planned_next_publish_time'])
 
             # Восстанавливаем пророчество и флаги
             self.current_prophecy = state.get('current_prophecy')
@@ -396,7 +400,7 @@ class ProphecyScheduler:
             # Генерируем пророчество
             prophecy = await self._generate_prophecy()
 
-            # Генерируем время следующей публикации
+            # Используем уже запланированное время следующей публикации
             next_next_publish_time = self.next_publish_time
             next_next_time_str = format_moscow_time(next_next_publish_time)
 
@@ -466,6 +470,9 @@ class ProphecyScheduler:
             next_next_publish_time = generate_next_publish_time()
             next_next_time_str = format_moscow_time(next_next_publish_time)
 
+            # Сохраняем запланированное время для использования при публикации
+            self.planned_next_publish_time = next_next_publish_time
+
             # Формируем сообщение для публикации с указанием времени СЛЕДУЮЩЕЙ публикации
             current_publish_time_str = format_moscow_time(self.next_publish_time)
             full_message = f"🔮 Пророчество от бота ({current_publish_time_str} МСК):\n\n{prophecy}\n\n" \
@@ -473,7 +480,7 @@ class ProphecyScheduler:
 
             self.current_prophecy = full_message
             self.generated_for_current_cycle = True  # Устанавливаем флаг, что генерация выполнена
-            self.save_state()  # Сохраняем сгенерированное пророчество
+            self.save_state()  # Сохраняем сгенерированное пророчество и запланированное время
 
             logger.info(f"Пророчество сгенерировано, готово к публикации в {current_publish_time_str}")
             logger.info(f"Следующее пророчество после этой публикации будет в {next_next_time_str}")
@@ -544,14 +551,19 @@ class ProphecyScheduler:
             # Публикуем
             await self._publish_prophecy(self.current_prophecy)
 
-            # Определяем время следующей публикации
-            next_next_publish_time = generate_next_publish_time()
+            # Используем запланированное время, если оно было сохранено, иначе генерируем новое
+            if self.planned_next_publish_time:
+                next_next_publish_time = self.planned_next_publish_time
+            else:
+                next_next_publish_time = generate_next_publish_time()
+
             self.next_publish_time = next_next_publish_time
             self.next_generation_time = self.next_publish_time - timedelta(seconds=GENERATION_OFFSET)
 
-            # Очищаем текущее пророчество и сбрасываем флаг генерации
+            # Очищаем текущее пророчество, сбрасываем флаги и очищаем запланированное время
             self.current_prophecy = None
             self.generated_for_current_cycle = False
+            self.planned_next_publish_time = None
 
             # Сохраняем новое состояние
             self.save_state()
